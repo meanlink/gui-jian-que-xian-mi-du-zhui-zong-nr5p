@@ -35,6 +35,29 @@ def seed_records():
     return sorted(rows, key=lambda row: row["mileage_km"])
 
 
+def _cluster_rows(records, eps, minimum, prefix=""):
+    """对一批缺陷点做一维DBSCAN并生成简报明细行；点数不足时全部按孤立点处理。"""
+    mileage = np.asarray([float(row["mileage_km"]) for row in records])
+    lateral = np.asarray([float(row["lateral_mm"]) for row in records])
+    severity = np.asarray([float(row["severity"]) for row in records])
+    if len(records) >= minimum:
+        labels = DBSCAN(eps=eps, min_samples=minimum).fit_predict((mileage * 1000).reshape(-1, 1))
+    else:
+        labels = np.full(len(records), -1)
+    clusters = sorted([int(v) for v in np.unique(labels) if v >= 0], key=lambda v: float(np.min(mileage[labels == v])))
+    rows = []
+    for display, cluster in enumerate(clusters, 1):
+        mask = labels == cluster
+        start, end = float(mileage[mask].min()), float(mileage[mask].max())
+        rows.append({"band": f"{prefix}缺陷带{display}", "count": int(mask.sum()), "from_km": round(start, 4), "to_km": round(end, 4), "span_m": round((end - start) * 1000, 1), "max_severity": int(severity[mask].max()), "mean_lateral": round(float(lateral[mask].mean()), 2), "review": "人工加密检查"})
+    noise = labels == -1
+    noise_count = int(noise.sum())
+    high_noise = int(np.sum(noise & (severity >= 4)))
+    if noise_count:
+        rows.append({"band": f"{prefix}孤立/稀疏点", "count": noise_count, "from_km": round(float(mileage[noise].min()), 4), "to_km": round(float(mileage[noise].max()), 4), "span_m": "—", "max_severity": int(severity[noise].max()), "mean_lateral": round(float(lateral[noise].mean()), 2), "review": "逐点复核，不连成区段"})
+    return rows, clusters, noise_count, high_noise, int((labels >= 0).sum())
+
+
 def analyze(records, params):
     try:
         eps = float(params.get("eps_m", 100))
@@ -54,23 +77,46 @@ def analyze(records, params):
         raise ValueError("里程、横向偏差与复核等级必须完整且为数值。") from exc
     if not np.isfinite(np.column_stack([mileage, lateral, severity])).all() or (mileage < 0).any() or not np.isin(severity, [1, 2, 3, 4, 5]).all():
         raise ValueError("里程须非负有限，横向偏差须有限，复核等级须为1~5整数。")
-    labels = DBSCAN(eps=eps, min_samples=minimum).fit_predict((mileage * 1000).reshape(-1, 1))
-    clusters = sorted([int(v) for v in np.unique(labels) if v >= 0], key=lambda v: float(np.min(mileage[labels == v])))
-    rows = []
-    for display, cluster in enumerate(clusters, 1):
-        mask = labels == cluster
-        start, end = float(mileage[mask].min()), float(mileage[mask].max())
-        rows.append({"band": f"缺陷带{display}", "count": int(mask.sum()), "from_km": round(start, 4), "to_km": round(end, 4), "span_m": round((end - start) * 1000, 1), "max_severity": int(severity[mask].max()), "mean_lateral": round(float(lateral[mask].mean()), 2), "review": "人工加密检查"})
-    noise = labels == -1
-    noise_count = int(noise.sum())
-    high_noise = int(np.sum(noise & (severity >= 4)))
-    if noise_count:
-        rows.append({"band": "孤立/稀疏点", "count": noise_count, "from_km": round(float(mileage[noise].min()), 4), "to_km": round(float(mileage[noise].max()), 4), "span_m": "—", "max_severity": int(severity[noise].max()), "mean_lateral": round(float(lateral[noise].mean()), 2), "review": "逐点复核，不连成区段"})
+    rows, clusters, noise_count, high_noise, in_bands = _cluster_rows(records, eps, minimum)
     return {
         "summary": f"在{len(records)}个缺陷点中识别{len(clusters)}条密集带，保留{noise_count}个孤立/稀疏点；邻域半径{eps:g}米。",
-        "metrics": [{"label": "密集缺陷带", "value": len(clusters), "unit": "条"}, {"label": "密集带内点数", "value": int((labels >= 0).sum())}, {"label": "噪声占比", "value": round(noise_count / len(records) * 100, 2), "unit": "%"}, {"label": "孤立高等级点", "value": high_noise}],
+        "metrics": [{"label": "密集缺陷带", "value": len(clusters), "unit": "条"}, {"label": "密集带内点数", "value": in_bands}, {"label": "噪声占比", "value": round(noise_count / len(records) * 100, 2), "unit": "%"}, {"label": "孤立高等级点", "value": high_noise}],
         "table": {"columns": [{"key": "band", "label": "密度分组"}, {"key": "count", "label": "缺陷点数"}, {"key": "from_km", "label": "起点km"}, {"key": "to_km", "label": "终点km"}, {"key": "span_m", "label": "跨度m"}, {"key": "max_severity", "label": "最高等级"}, {"key": "mean_lateral", "label": "平均横偏mm"}, {"key": "review", "label": "复核动作"}], "rows": rows},
         "chart": {"type": "bar", "labels": [row["band"] for row in rows], "series": [{"name": "缺陷点数", "values": [row["count"] for row in rows]}]},
         "findings": [f"孤立点中有{high_noise}个等级≥4的缺陷，不能因为被标为噪声而忽略。", "收紧邻域半径会使密度带分裂或增加噪声；扩大半径可能把相邻问题连接。", "缺陷带按起始里程排序，标签仅用于定位，不表示处理优先级。"],
         "method": metadata()["method"], "warnings": ["噪声仅指不满足当前密度条件，不代表无效数据或低风险。"] + (["当前参数未识别出密集带，可核查数据范围或适度增大半径。"] if not clusters else []),
+    }
+
+
+def analyze_external(records, params, ranges):
+    """外协简报：仅获准里程入算，沿用已批准试验的参数，隔着禁发区的点各自独立聚类。"""
+    try:
+        eps = float(params.get("eps_m", 100))
+        minimum = int(float(params.get("min_points", 5)))
+    except (TypeError, ValueError, OverflowError):
+        eps, minimum = 100, 5
+    rows, band_total, point_total, noise_total, high_noise = [], 0, 0, 0, 0
+    for index, rng in enumerate(ranges or [], 1):
+        seg = [row for row in records if float(rng["from_km"]) <= float(row["mileage_km"]) <= float(rng["to_km"])]
+        if not seg:
+            continue
+        seg_rows, clusters, noise_count, seg_high, _ = _cluster_rows(seg, eps, minimum, prefix=f"区段{index} · ")
+        rows.extend(seg_rows)
+        band_total += len(clusters)
+        point_total += len(seg)
+        noise_total += noise_count
+        high_noise += seg_high
+    if point_total:
+        summary = f"公开范围{len(ranges or [])}段共{point_total}个缺陷点，识别{band_total}条密集带，保留{noise_total}个孤立/稀疏点；禁发区两侧各自独立计算，邻域半径{eps:g}米。"
+    else:
+        summary = "公开范围未覆盖任何缺陷点，本简报不含明细。"
+    return {
+        "summary": summary,
+        "metrics": [{"label": "公开区段", "value": len(ranges or []), "unit": "段"}, {"label": "密集缺陷带", "value": band_total, "unit": "条"}, {"label": "覆盖缺陷点", "value": point_total}, {"label": "孤立高等级点", "value": high_noise}],
+        "table": {"columns": [{"key": "band", "label": "密度分组"}, {"key": "count", "label": "缺陷点数"}, {"key": "from_km", "label": "起点km"}, {"key": "to_km", "label": "终点km"}, {"key": "span_m", "label": "跨度m"}, {"key": "max_severity", "label": "最高等级"}, {"key": "mean_lateral", "label": "平均横偏mm"}, {"key": "review", "label": "复核动作"}], "rows": rows},
+        "chart": {"type": "bar", "labels": [row["band"] for row in rows], "series": [{"name": "缺陷点数", "values": [row["count"] for row in rows]}]},
+        "findings": [f"孤立点中有{high_noise}个等级≥4的缺陷，需逐点复核。", "各公开区段隔着禁发区独立聚类，缺陷带不跨禁发区延伸。", "缺陷带按区段内起始里程排序，标签仅用于定位，不表示处理优先级。"],
+        "method": metadata()["method"] + " 外协简报仅覆盖获准里程，公开区段之间隔着禁发区各自独立计算。",
+        "warnings": ["本简报仅包含获准里程，禁发区内的缺陷点不在其内。"],
+        "scope": [{"from_km": float(r["from_km"]), "to_km": float(r["to_km"])} for r in (ranges or [])],
     }

@@ -16,6 +16,7 @@ async function render(){
    if(!workspace.meta){workspace.meta=await api('/meta');document.title=workspace.meta.name;document.documentElement.style.setProperty('--accent',workspace.meta.accent||'oklch(48% 0.13 145)');document.body.dataset.style=workspace.meta.style||'ledger';}
    const {page,id}=route();
    if(!session.token||page==='login'){login();return;}
+   if(session.user.role==='external'&&page!=='reports'){location.hash='#/reports';return;}
    const pages={overview,datasets:dataPage,workbench,results:()=>results(id),reports:reportPage};
    const content=await (pages[page]||overview)();app.innerHTML=shell(page,content);
    document.querySelector('#logout').onclick=()=>{session.clear();location.hash='#/login';render();};
